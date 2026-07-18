@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pops-ingest"
+version = "0.1.0"
+description = "Layout-aware ingestion and table extraction for POPS Excel workbooks"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openpyxl>=3.1.5,<4",
+]
+
+[project.scripts]
+pops-ingest = "pops_ingest.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
