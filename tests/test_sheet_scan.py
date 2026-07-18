@@ -90,7 +90,61 @@ class SheetScanTests(unittest.TestCase):
                 formula_book.close()
                 cached_book.close()
 
+    def test_malformed_formula_is_preserved_with_tokenizer_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "broken_formula.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "Data"
+            worksheet["A1"] = "Metric"
+            worksheet["B1"] = "2026"
+            worksheet["A2"] = "Broken formula"
+            worksheet["B2"] = "=#REF!:#REF!"
+            workbook.save(source)
+
+            config = ExtractionConfig()
+            index = OOXMLIndex.open(source, config)
+            formula_book = load_workbook(source, data_only=False)
+            cached_book = load_workbook(source, data_only=True)
+            try:
+                registry = StyleRegistry()
+                profile = scan_sheet(
+                    formula_book["Data"],
+                    cached_book["Data"],
+                    index.formula_records["Data"],
+                    config,
+                    registry,
+                )
+                snapshot = cell_snapshot(
+                    formula_book["Data"],
+                    cached_book["Data"],
+                    2,
+                    2,
+                    profile,
+                    index.formula_records["Data"],
+                    registry,
+                )
+                formula = snapshot["formula"]
+                self.assertEqual(formula["exact"], "=#REF!:#REF!")
+                self.assertEqual(formula["dependencies"], [])
+                self.assertEqual(
+                    formula["normalized_relative_signature"], "=#REF!:#REF!"
+                )
+                self.assertEqual(formula["tokenization_status"], "failed")
+                self.assertEqual(
+                    formula["tokenization_error"]["type"], "TokenizerError"
+                )
+                self.assertTrue(
+                    any(
+                        warning.code == "FORMULA_TOKENIZATION_FAILED"
+                        and warning.coordinate == "B2"
+                        for warning in profile.warnings
+                    )
+                )
+            finally:
+                formula_book.close()
+                cached_book.close()
+
 
 if __name__ == "__main__":
     unittest.main()
-

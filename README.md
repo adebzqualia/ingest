@@ -133,6 +133,8 @@ Supported: `.xlsx`, `.xlsm`, `.xltx`, `.xltm` OOXML packages. Macro parts are in
 
 Legacy `.xls`, binary `.xlsb`, encrypted/password-protected, malformed, and non-ZIP files fail with an actionable error. Before loading, the tool checks file size, ZIP entry count, total expanded size, and extreme compression ratios. Per-sheet material-cell and table-area limits prevent an inflated worksheet dimension or full-column rule from forcing a dense million-row scan.
 
+Stale Excel defined names such as `=#REF!:#REF!` are treated differently from a malformed workbook package: their raw definitions and parse diagnostics are retained in `manifest.json`, a warning is emitted, and extraction continues. Such names are never used as table ranges.
+
 ## Verification
 
 The test suite builds POPS-like workbooks containing merged hierarchy headers, stacked/side-by-side tables, blank bordered grids, formulas without caches, native Excel Tables, hidden/grouped dimensions, validations, comments, hyperlinks, named ranges, notes, and formula-injection strings.

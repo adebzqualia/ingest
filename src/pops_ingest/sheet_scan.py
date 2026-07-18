@@ -556,28 +556,30 @@ def _index_raw_formula_records(records: Any, sheet_name: str) -> dict[str, Any]:
     return result
 
 
-def _dependencies_from_formula(formula: str | None) -> list[Any]:
+def _dependencies_from_formula(
+    formula: str | None,
+) -> tuple[list[Any], dict[str, str] | None]:
     """Extract raw range/name operands without attempting workbook evaluation."""
 
     if not formula:
-        return []
+        return [], None
     expression = formula if formula.startswith("=") else "=" + formula
     try:
         tokens = Tokenizer(expression).items
-    except (IndexError, TypeError, ValueError):
-        return []
+    except Exception as exc:  # noqa: BLE001 - untrusted workbook parser boundary
+        return [], {"type": type(exc).__name__, "message": str(exc)}
     result: list[str] = []
     for token in tokens:
         if token.type == "OPERAND" and token.subtype == "RANGE":
             dependency = str(token.value)
             if dependency not in result:
                 result.append(dependency)
-    return result
+    return result, None
 
 
 def _relative_reference_signature(
     formula: str | None, origin_row: int, origin_col: int
-) -> str | None:
+) -> tuple[str | None, dict[str, str] | None]:
     """Normalize A1 operands to R1C1-like relative offsets.
 
     Tokenization prevents strings such as ``"A1"`` from being rewritten.  Named
@@ -585,12 +587,15 @@ def _relative_reference_signature(
     """
 
     if not formula:
-        return None
+        return None, None
     expression = formula if formula.startswith("=") else "=" + formula
     try:
         tokens = Tokenizer(expression).items
-    except (IndexError, TypeError, ValueError):
-        return normalize_whitespace(expression)
+    except Exception as exc:  # noqa: BLE001 - untrusted workbook parser boundary
+        return normalize_whitespace(expression), {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
 
     def replace_reference(match: re.Match[str]) -> str:
         column = column_index_from_string(match.group("col"))
@@ -617,7 +622,7 @@ def _relative_reference_signature(
             else:
                 value = _CELL_REFERENCE_RE.sub(replace_reference, value)
         output.append(value)
-    return "=" + "".join(output)
+    return "=" + "".join(output), None
 
 
 def _formula_info(cell: Any, record: Any, row: int, col: int) -> dict[str, Any] | None:
@@ -663,12 +668,20 @@ def _formula_info(cell: Any, record: Any, row: int, col: int) -> dict[str, Any] 
             "signature",
         ),
     )
+    tokenization_attempted = False
+    tokenization_error: dict[str, str] | None = None
     if signature is None:
-        signature = _relative_reference_signature(resolved_text, row, col)
+        tokenization_attempted = True
+        signature, tokenization_error = _relative_reference_signature(
+            resolved_text, row, col
+        )
 
     dependencies = _record_value(record, ("dependencies", "references", "refs"))
     if dependencies is None:
-        dependencies = _dependencies_from_formula(resolved_text)
+        tokenization_attempted = True
+        dependencies, dependency_error = _dependencies_from_formula(resolved_text)
+        if tokenization_error is None:
+            tokenization_error = dependency_error
 
     formula_kind = _record_value(record, ("kind", "formula_kind", "formula_type"))
     if formula_kind is None:
@@ -683,6 +696,14 @@ def _formula_info(cell: Any, record: Any, row: int, col: int) -> dict[str, Any] 
         "kind": str(formula_kind),
         "normalized_relative_signature": _primitive(signature),
         "dependencies": _primitive(dependencies),
+        "tokenization_status": (
+            "failed"
+            if tokenization_error
+            else "parsed"
+            if tokenization_attempted
+            else "provided"
+        ),
+        "tokenization_error": tokenization_error,
         "raw_record": metadata,
     }
 
@@ -1426,6 +1447,26 @@ def scan_sheet(
             strong_evidence.add((row, col))
         if feature.has_formula:
             formula_coordinates.add(feature.coordinate)
+            formula_metadata = snapshot.get("formula")
+            if (
+                isinstance(formula_metadata, Mapping)
+                and formula_metadata.get("tokenization_status") == "failed"
+            ):
+                warnings.append(
+                    WarningRecord(
+                        code="FORMULA_TOKENIZATION_FAILED",
+                        message=(
+                            "Formula text was preserved, but dependency and relative-"
+                            "signature parsing could not be completed."
+                        ),
+                        sheet=ws.title,
+                        coordinate=feature.coordinate,
+                        details={
+                            "formula": formula_metadata.get("exact"),
+                            "error": formula_metadata.get("tokenization_error"),
+                        },
+                    )
+                )
             if snapshot["cache_status"] == "present":
                 cached_formula_count += 1
             elif snapshot["cache_status"] == "missing":

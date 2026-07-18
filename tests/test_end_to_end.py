@@ -6,6 +6,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from openpyxl import load_workbook
+from openpyxl.workbook.defined_name import DefinedName
+
 from pops_ingest.config import ExtractionConfig
 from pops_ingest.extractor import extract_workbook
 from pops_ingest.ooxml import OOXMLIndex
@@ -186,6 +189,58 @@ class EndToEndExtractionTests(unittest.TestCase):
             for table in sheet["tables"]
         ]
         self.assertEqual(first_tables, second_tables)
+
+    def test_broken_defined_names_warn_and_do_not_abort_extraction(self) -> None:
+        workbook = load_workbook(self.source, data_only=False)
+        try:
+            workbook.defined_names.add(
+                DefinedName("BrokenGlobal", attr_text="=#REF!:#REF!")
+            )
+            workbook["OBS KPI"].defined_names.add(
+                DefinedName("BrokenLocal", attr_text="=#REF!:#REF!")
+            )
+            workbook.save(self.source)
+        finally:
+            workbook.close()
+
+        destination = extract_workbook(
+            self.source,
+            ["OBS KPI"],
+            self.root / "broken_names",
+            config=self.config,
+            ooxml_index=OOXMLIndex.open(self.source, self.config),
+            selection_method="test",
+        )
+        manifest = _json(destination / "manifest.json")
+        names = {
+            (item["name"], item["scope"]): item
+            for item in manifest["workbook"]["defined_names"]
+        }
+        for key in (
+            ("BrokenGlobal", "workbook"),
+            ("BrokenLocal", "sheet:OBS KPI"),
+        ):
+            self.assertEqual(names[key]["definition"], "=#REF!:#REF!")
+            self.assertEqual(names[key]["status"], "broken")
+            self.assertEqual(names[key]["destinations"], [])
+            self.assertEqual(names[key]["destination_parse_status"], "failed")
+            self.assertEqual(
+                names[key]["destination_parse_error"]["type"], "TokenizerError"
+            )
+
+        warnings = [
+            item
+            for item in manifest["warnings"]
+            if item["code"] == "DEFINED_NAME_BROKEN_REFERENCE"
+        ]
+        self.assertCountEqual(
+            [item["defined_name"] for item in warnings],
+            ["BrokenGlobal", "BrokenLocal"],
+        )
+        local_warning = next(
+            item for item in warnings if item["defined_name"] == "BrokenLocal"
+        )
+        self.assertEqual(local_warning["sheet"], "OBS KPI")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ The manifest records source provenance, selected/unselected sheets, extraction c
 
 Country inputs are expected to change content while keeping the reference structure stable.
 
+Defined names retain their raw `definition`, scope, parsed destinations, and destination parsing status. Broken or malformed names (for example, `=#REF!:#REF!`) are preserved with `status: "broken"` or `status: "invalid_unparsed"`; they generate a warning and are excluded from table detection instead of aborting extraction.
+
 ## `cells.jsonl`
 
 Each line is one coordinate-aware cell record. Important fields are:
@@ -37,6 +39,8 @@ Each line is one coordinate-aware cell record. Important fields are:
 ```
 
 Formula caches are not claimed to be recalculated or current.
+
+`formula_tokenization_status` and `formula_tokenization_error` distinguish a preserved formula that could not be parsed for dependencies or a relative signature. A malformed/error expression never prevents the remaining cells or sheets from being extracted.
 
 ## `table.json`
 
@@ -70,4 +74,3 @@ Each record is an interpreted table observation with direct cell provenance:
 ## Styles
 
 `styles.json` is keyed by a hash of semantic font/fill/border/alignment/protection/number-format properties. Workbook-local `style_id` is retained on cells for provenance but is not used as the comparison identity, because style IDs can change after a harmless Excel re-save.
-

@@ -19,6 +19,7 @@ from . import __version__
 from .config import ExtractionConfig
 from .detection import detect_table_candidates
 from .metadata import (
+    defined_name_diagnostics,
     defined_names_metadata,
     static_named_ranges_for_sheet,
     workbook_metadata,
@@ -88,6 +89,7 @@ def _deduplicate_warnings(values: Iterable[Mapping[str, Any]]) -> list[dict[str,
             warning.get("sheet"),
             warning.get("coordinate"),
             warning.get("table_id"),
+            warning.get("defined_name"),
         )
         if key in seen:
             continue
@@ -187,12 +189,20 @@ def _normalize_snapshot(
             "normalized_relative_signature"
         )
         result["formula_dependencies"] = formula_metadata.get("dependencies", [])
+        result["formula_tokenization_status"] = formula_metadata.get(
+            "tokenization_status"
+        )
+        result["formula_tokenization_error"] = formula_metadata.get(
+            "tokenization_error"
+        )
     elif formula_metadata:
         result["formula"] = str(formula_metadata)
         result.setdefault("formula_metadata", {"exact": str(formula_metadata)})
     else:
         result["formula"] = None
         result.setdefault("formula_metadata", None)
+        result.setdefault("formula_tokenization_status", None)
+        result.setdefault("formula_tokenization_error", None)
     result["formula_sha256"] = (
         stable_hash(result["formula"]) if result.get("formula") else None
     )
@@ -556,12 +566,21 @@ def extract_workbook(
         raise ExtractionError("At least one sheet must be selected.")
 
     workbook_formula = _load_openpyxl_workbook(source_path, data_only=False)
-    workbook_cached = (
-        _load_openpyxl_workbook(source_path, data_only=True)
-        if config.include_cached_values
-        else None
-    )
-    defined_names = defined_names_metadata(workbook_formula)
+    workbook_cached = None
+    try:
+        if config.include_cached_values:
+            workbook_cached = _load_openpyxl_workbook(source_path, data_only=True)
+        defined_names = defined_names_metadata(workbook_formula)
+    except Exception:
+        # Metadata preparation happens before the atomic bundle is opened.
+        # Close both ZIP-backed workbooks here as well so a hostile metadata
+        # edge cannot leave the source locked on Windows.
+        try:
+            workbook_formula.close()
+        finally:
+            if workbook_cached is not None:
+                workbook_cached.close()
+        raise
     styles = StyleRegistry()
     extraction_time = datetime.now(timezone.utc).isoformat()
     source_stat = source_path.stat()
@@ -575,7 +594,10 @@ def extract_workbook(
         "sha256": sha256_file(source_path),
         "format": source_path.suffix.casefold().lstrip("."),
     }
-    all_warnings: list[dict[str, Any]] = [_warning_dict(item) for item in ooxml.warnings]
+    all_warnings: list[dict[str, Any]] = [
+        *[_warning_dict(item) for item in ooxml.warnings],
+        *defined_name_diagnostics(defined_names),
+    ]
     report_data: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "source": source_info,
@@ -620,7 +642,11 @@ def extract_workbook(
                     styles,
                 )
                 explicit_ranges = list(_profile_value(profile, "explicit_tables", []))
-                named_ranges = static_named_ranges_for_sheet(defined_names, sheet_name)
+                named_ranges = static_named_ranges_for_sheet(
+                    defined_names,
+                    sheet_name,
+                    max_area=config.max_table_area,
+                )
                 merged_ranges = [Bounds.from_a1(_range_text(value)) for value in ws.merged_cells.ranges]
                 accepted, rejected = detect_table_candidates(
                     _profile_value(profile, "features", {}),
