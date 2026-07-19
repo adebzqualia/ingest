@@ -147,10 +147,83 @@ BUNDLE_SCHEMA: dict[str, object] = {
             },
             "additionalProperties": True,
         },
+        "clean_table": {
+            "type": "object",
+            "required": [
+                "status",
+                "title",
+                "source_range",
+                "header_rows",
+                "columns",
+                "rows",
+                "dropped_rows",
+                "dropped_columns",
+                "counts",
+            ],
+            "properties": {
+                "status": {"enum": ["ready", "empty"]},
+                "title": {"type": ["string", "null"]},
+                "source_range": {"type": "string"},
+                "header_rows": {"type": "array", "items": {"type": "integer"}},
+                "columns": {"type": "array"},
+                "rows": {"type": "array"},
+                "dropped_rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["source_row", "reason"],
+                        "properties": {
+                            "source_row": {"type": "integer", "minimum": 1},
+                            "reason": {"type": "string"},
+                        },
+                        "additionalProperties": True,
+                    },
+                },
+                "dropped_columns": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "source_column",
+                            "source_letter",
+                            "reason",
+                        ],
+                        "properties": {
+                            "source_column": {
+                                "type": "integer",
+                                "minimum": 1,
+                            },
+                            "source_letter": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "additionalProperties": True,
+                    },
+                },
+                "counts": {"type": "object"},
+            },
+            "additionalProperties": True,
+        },
+        "clean_record": {
+            "type": "object",
+            "required": ["table_id", "sheet", "source_row", "values"],
+            "properties": {
+                "table_id": {"type": "string", "pattern": "^tbl_"},
+                "sheet": {"type": "string"},
+                "source_row": {"type": ["integer", "null"]},
+                "values": {"type": "object"},
+                "formulas": {"type": "object"},
+                "source_cells": {"type": "object"},
+            },
+            "additionalProperties": True,
+        },
     },
     "x-jsonl-item-schemas": {
         "sheets/*/cells.jsonl": "#/$defs/cell",
         "sheets/*/tables/*/table.json": "#/$defs/logical_table",
         "records_long.jsonl": "#/$defs/long_record",
+        "clean_records.jsonl": "#/$defs/clean_record",
+    },
+    "x-json-artifact-schemas": {
+        "sheets/*/tables/*/clean_table.json": "#/$defs/clean_table",
     },
 }

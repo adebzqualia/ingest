@@ -58,7 +58,9 @@ reference_ingestion/
 ├── manifest.json               workbook inventory, selection, hashes, warnings
 ├── schema.json                 JSON Schema plus JSONL item definitions
 ├── styles.json                 deduplicated semantic style definitions
-├── tables_index.csv            one row per detected table
+├── tables_index.csv            one row per detected raw region
+├── clean_tables_index.csv      one row per usable clean table
+├── clean_records.jsonl         structured clean business rows
 ├── records_long.jsonl          authoritative tidy observations
 ├── records_long.csv            review-safe secondary export
 └── sheets/
@@ -69,12 +71,17 @@ reference_ingestion/
         └── tables/
             └── 01_tbl_.../
                 ├── table.json
+                ├── clean_table.json       clean schema + cell provenance
+                ├── clean_table.csv        readable values/formula fallback
+                ├── clean_formulas.csv     clean shape with formulas visible
                 ├── records_long.jsonl
                 ├── records_long.csv
                 └── values_wide.csv
 ```
 
-Open `report.html` directly in a browser. It shows selected sheets, detected ranges, confidence/reasons, warnings, structured column keys, source coordinates, and a grid toggle for effective values, exact formulas, and cached workbook results.
+Open `report.html` directly in a browser. It opens the first usable clean table, with presentation banners, notes, blank spacer rows, and body-empty columns removed. Multi-row Excel headers are flattened into readable business column names. A Raw toggle keeps the original detected rectangle available for audit, alongside value, exact-formula, and cached-result modes.
+
+Post-processing never deletes evidence from the extraction bundle. Every removal decision is listed in `clean_table.json`; false regions with no business rows are marked `empty` and hidden from the report's default navigation. This separation gives downstream analysis clean tables while preserving the coordinate-faithful layer needed for later country-template anomaly detection.
 
 JSON/JSONL is authoritative. CSV formula-like text is prefixed with an apostrophe to prevent spreadsheet-formula injection if a reviewer opens it in Excel; exact formula text remains unchanged in JSONL.
 

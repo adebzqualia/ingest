@@ -71,6 +71,26 @@ Each record is an interpreted table observation with direct cell provenance:
 
 `value_state` distinguishes at least `blank`, `formula_cache_missing`, `zero`, `number`, `dash`, `ns`, `placeholder`, `excel_error`, `boolean`, and `text`.
 
+## Clean table artifacts
+
+Every detected region is post-processed into `clean_table.json`. The raw range remains unchanged for audit and future anomaly detection, while the clean artifact:
+
+- removes presentation banners, notes, instructions, footnotes, header rows, section-only rows, and empty spacer rows;
+- removes columns that are empty throughout the retained business rows;
+- flattens contributing merged/multi-row headers into unique, readable column labels;
+- carries section/group context onto each retained row instead of keeping decorative separator rows;
+- retains source coordinates, typed literal values, exact formulas, cached values, and number formats for every clean cell.
+
+Regions with no usable business rows or columns receive `status: "empty"` and are excluded from the default report navigation. They remain available in the raw table and cell artifacts.
+
+For `status: "ready"`, each table directory also contains:
+
+- `clean_table.csv`: readable values, using the exact formula when no cached result exists;
+- `clean_formulas.csv`: the same clean shape with formulas visible where present;
+- `clean_table.json`: authoritative clean rows, columns, provenance, and removal decisions.
+
+At bundle root, `clean_tables_index.csv` lists only usable clean tables and `clean_records.jsonl` provides one structured object per clean row.
+
 ## Styles
 
 `styles.json` is keyed by a hash of semantic font/fill/border/alignment/protection/number-format properties. Workbook-local `style_id` is retained on cells for provenance but is not used as the comparison identity, because style IDs can change after a harmless Excel re-save.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import csv
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -78,6 +79,8 @@ class EndToEndExtractionTests(unittest.TestCase):
         self.assertIn("cell", schema["$defs"])
         self.assertTrue((destination / "records_long.jsonl").is_file())
         self.assertTrue((destination / "tables_index.csv").is_file())
+        self.assertTrue((destination / "clean_records.jsonl").is_file())
+        self.assertTrue((destination / "clean_tables_index.csv").is_file())
         self.assertGreater(sum(s["counts"]["detected_tables"] for s in manifest["sheets"]), 2)
 
         obs_manifest = next(sheet for sheet in manifest["sheets"] if sheet["name"] == "OBS KPI")
@@ -116,6 +119,102 @@ class EndToEndExtractionTests(unittest.TestCase):
         formula_csv = next(row for row in csv_rows if row["source_cell"] == "E6")
         self.assertEqual(formula_csv["formula"], "'=D6-C6")
 
+        with (destination / "clean_tables_index.csv").open(
+            encoding="utf-8", newline=""
+        ) as handle:
+            clean_index = list(csv.DictReader(handle))
+        self.assertEqual(len(clean_index), 4)
+        self.assertEqual(
+            len(clean_index),
+            sum(sheet["counts"]["clean_tables"] for sheet in manifest["sheets"]),
+        )
+        for entry in clean_index:
+            for path_field in ("json_path", "csv_path", "formulas_csv_path"):
+                self.assertTrue(
+                    (destination / entry[path_field]).is_file(),
+                    f"Missing {path_field} for {entry['table_id']}",
+                )
+
+        obs_table = obs_sheet["detected_tables"][0]
+        obs_table_root = destination / obs_table["relative_path"]
+        obs_table_json = _json(obs_table_root / "table.json")
+        obs_clean = _json(obs_table_root / "clean_table.json")
+        obs_clean_index = next(
+            entry for entry in clean_index if entry["table_id"] == obs_table["table_id"]
+        )
+        self.assertEqual(obs_clean_index["source_range"], "B3:H11")
+        self.assertEqual(obs_clean_index["rows"], "5")
+        self.assertEqual(obs_clean_index["columns"], "7")
+        self.assertEqual(
+            destination / obs_clean_index["json_path"],
+            obs_table_root / "clean_table.json",
+        )
+        self.assertTrue(
+            {
+                "status",
+                "title",
+                "source_range",
+                "header_rows",
+                "columns",
+                "rows",
+                "dropped_rows",
+                "dropped_columns",
+                "counts",
+            }.issubset(obs_clean)
+        )
+        self.assertEqual(obs_clean["status"], "ready")
+        self.assertEqual(obs_clean["title"], "OBS KPIs EVOLUTION")
+        self.assertEqual(obs_clean["source_range"], "B3:H11")
+        self.assertEqual(obs_clean["header_rows"], [3, 4])
+        self.assertEqual(obs_clean["counts"]["rows"], len(obs_clean["rows"]))
+        self.assertEqual(obs_clean["counts"]["columns"], len(obs_clean["columns"]))
+        self.assertEqual(
+            obs_clean["counts"]["cells"],
+            len(obs_clean["rows"]) * len(obs_clean["columns"]),
+        )
+        self.assertEqual(obs_table_json["clean"]["status"], "ready")
+        self.assertEqual(
+            obs_table_json["clean"]["files"],
+            {
+                "json": obs_clean_index["json_path"],
+                "csv": obs_clean_index["csv_path"],
+                "formulas_csv": obs_clean_index["formulas_csv_path"],
+            },
+        )
+
+        clean_row_six = next(row for row in obs_clean["rows"] if row["source_row"] == 6)
+        clean_e6 = next(
+            cell for cell in clean_row_six["cells"] if cell["coordinate"] == "E6"
+        )
+        self.assertEqual(clean_e6["value"], "=D6-C6")
+        self.assertEqual(clean_e6["formula"], "=D6-C6")
+        self.assertIsNone(clean_e6["cached"])
+        self.assertIsNone(clean_e6["literal"])
+        self.assertEqual(clean_e6["cached_value_status"], "missing")
+        self.assertEqual(clean_e6["number_format"], "0.0%")
+
+        clean_labels = [column["label"] for column in obs_clean["columns"]]
+        clean_e6_column = next(
+            index
+            for index, column in enumerate(obs_clean["columns"])
+            if column["source_column"] == 5
+        )
+        clean_row_six_index = next(
+            index
+            for index, row in enumerate(obs_clean["rows"], start=1)
+            if row["source_row"] == 6
+        )
+        for path_field in ("csv_path", "formulas_csv_path"):
+            with (destination / obs_clean_index[path_field]).open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                clean_csv_rows = list(csv.reader(handle))
+            self.assertEqual(clean_csv_rows[0], clean_labels)
+            self.assertEqual(len(clean_csv_rows), obs_clean["counts"]["rows"] + 1)
+            self.assertEqual(
+                clean_csv_rows[clean_row_six_index][clean_e6_column], "'=D6-C6"
+            )
+
         kpi_manifest = next(sheet for sheet in manifest["sheets"] if sheet["name"] == "KPI")
         kpi_sheet = _json(destination / kpi_manifest["relative_path"] / "sheet.json")
         self.assertEqual(kpi_sheet["explicit_excel_tables"][0]["name"], "KPIReference")
@@ -125,6 +224,22 @@ class EndToEndExtractionTests(unittest.TestCase):
         ]
         self.assertEqual(len(native_matches), 1)
         self.assertEqual(native_matches[0]["title"], "KPIReference")
+        kpi_clean_index = next(
+            entry
+            for entry in clean_index
+            if entry["table_id"] == native_matches[0]["table_id"]
+        )
+        with (destination / kpi_clean_index["csv_path"]).open(
+            encoding="utf-8", newline=""
+        ) as handle:
+            kpi_clean_rows = list(csv.reader(handle))
+        self.assertEqual(kpi_clean_rows[0][:4], [
+            "KPI",
+            "Source",
+            "Unit",
+            "Annual Reference calculation",
+        ])
+        self.assertEqual(kpi_clean_rows[-1][:4], ["TOTAL", "", "", ""])
 
         mbs_manifest = next(
             sheet for sheet in manifest["sheets"] if sheet["name"] == "MBS (OPEX)"
@@ -134,6 +249,27 @@ class EndToEndExtractionTests(unittest.TestCase):
             [table["range"] for table in mbs_sheet["detected_tables"]],
             ["B3:O9", "B13:O18"],
         )
+        clean_records = _jsonl(destination / "clean_records.jsonl")
+        self.assertEqual(
+            len(clean_records), sum(int(entry["rows"]) for entry in clean_index)
+        )
+        obs_clean_record = next(
+            record
+            for record in clean_records
+            if record["table_id"] == obs_table["table_id"]
+            and record["source_row"] == 6
+        )
+        clean_e6_key = obs_clean["columns"][clean_e6_column]["key"]
+        self.assertEqual(obs_clean_record["values"][clean_e6_key], "=D6-C6")
+        self.assertEqual(obs_clean_record["formulas"][clean_e6_key], "=D6-C6")
+        self.assertEqual(obs_clean_record["source_cells"][clean_e6_key], "E6")
+        merged_follower = next(
+            record
+            for record in clean_records
+            if record["sheet"] == "MBS (OPEX)" and record["source_row"] == 6
+        )
+        self.assertEqual(merged_follower["values"]["entity"], "BUSINESS OUTSOURCING")
+        self.assertEqual(merged_follower["source_cells"]["entity"], "B5")
         self.assertTrue(
             any(
                 annotation["range"] == "Q4"
@@ -157,6 +293,55 @@ class EndToEndExtractionTests(unittest.TestCase):
         self.assertIn("POPS workbook extraction", report)
         self.assertIn("OBS KPI", report)
         self.assertIn('href="schema.json"', report)
+        report_data_match = re.search(
+            r'<script id="report-data" type="application/json">(.*?)</script>',
+            report,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(report_data_match)
+        report_data = json.loads(report_data_match.group(1))
+        obs_report_sheet = next(
+            sheet for sheet in report_data["sheets"] if sheet["name"] == "OBS KPI"
+        )
+        obs_report_navigation = next(
+            table
+            for table in obs_report_sheet["tables"]
+            if table["table_id"] == obs_table["table_id"]
+        )
+        self.assertEqual(obs_report_navigation["clean_status"], "ready")
+        self.assertEqual(obs_report_navigation["clean_title"], obs_clean["title"])
+        self.assertEqual(obs_report_navigation["clean_rows"], obs_clean["counts"]["rows"])
+        self.assertEqual(
+            obs_report_navigation["clean_columns"], obs_clean["counts"]["columns"]
+        )
+        obs_report_clean = report_data["table_lookup"][obs_table["table_id"]]["clean"]
+        self.assertEqual(obs_report_clean["status"], "ready")
+        report_e6 = next(
+            cell
+            for row in obs_report_clean["rows"]
+            if row["source_row"] == 6
+            for cell in row["cells"]
+            if cell["coordinate"] == "E6"
+        )
+        self.assertEqual(report_e6["formula"], "=D6-C6")
+        self.assertEqual(report_e6["value"], "=D6-C6")
+
+        self.assertEqual(
+            schema["x-json-artifact-schemas"][
+                "sheets/*/tables/*/clean_table.json"
+            ],
+            "#/$defs/clean_table",
+        )
+        clean_schema = schema["$defs"]["clean_table"]
+        required_clean_fields = {"dropped_rows", "dropped_columns"}
+        self.assertTrue(
+            required_clean_fields.issubset(clean_schema["required"]),
+            "Clean-table schema must require dropped row/column provenance",
+        )
+        self.assertTrue(
+            required_clean_fields.issubset(clean_schema["properties"]),
+            "Clean-table schema must describe dropped row/column provenance",
+        )
 
     def test_structure_hashes_and_table_ids_are_repeatable(self) -> None:
         first = extract_workbook(

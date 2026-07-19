@@ -16,6 +16,7 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from . import __version__
+from .cleaning import build_clean_table
 from .config import ExtractionConfig
 from .detection import detect_table_candidates
 from .metadata import (
@@ -96,6 +97,43 @@ def _deduplicate_warnings(values: Iterable[Mapping[str, Any]]) -> list[dict[str,
         seen.add(key)
         result.append(warning)
     return result
+
+
+def _summarize_warnings(
+    values: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse report warnings by code while the manifest keeps every locus."""
+
+    groups: dict[str, dict[str, Any]] = {}
+    for value in values:
+        warning = dict(value)
+        code = str(warning.get("code") or "EXTRACTION_WARNING")
+        group = groups.setdefault(
+            code,
+            {
+                "code": code,
+                "count": 0,
+                "severity": warning.get("severity", "warning"),
+                "message": warning.get("message", ""),
+                "examples": [],
+            },
+        )
+        group["count"] += 1
+        examples = group["examples"]
+        if len(examples) < 5:
+            examples.append(
+                {
+                    key: warning.get(key)
+                    for key in (
+                        "sheet",
+                        "coordinate",
+                        "table_id",
+                        "defined_name",
+                    )
+                    if warning.get(key) is not None
+                }
+            )
+    return [groups[code] for code in sorted(groups)]
 
 
 def _range_text(value: object) -> str:
@@ -487,6 +525,47 @@ def _table_preview(
     }
 
 
+def _clean_table_preview(
+    clean: Mapping[str, Any], config: ExtractionConfig
+) -> dict[str, Any]:
+    """Bound a clean table for the embedded report without changing exports."""
+
+    result = dict(clean)
+    columns = list(clean.get("columns", []))
+    rows = list(clean.get("rows", []))
+    shown_columns = columns[: config.preview_columns]
+    shown_rows: list[dict[str, Any]] = []
+    for row in rows[: config.preview_rows]:
+        payload = dict(row)
+        payload["cells"] = list(row.get("cells", []))[: len(shown_columns)]
+        shown_rows.append(payload)
+    result["columns"] = shown_columns
+    result["rows"] = shown_rows
+    truncated = len(columns) > len(shown_columns) or len(rows) > len(shown_rows)
+    result["preview_note"] = (
+        f"Clean preview limited to {config.preview_rows} rows x "
+        f"{config.preview_columns} columns; clean_table.json/CSV contain everything."
+        if truncated
+        else "Complete clean table shown."
+    )
+    return result
+
+
+def _clean_cell_export_value(cell: Mapping[str, Any], *, formula_view: bool) -> Any:
+    """Choose a readable clean CSV value while retaining formulas in JSON."""
+
+    formula = cell.get("formula")
+    if formula_view and formula:
+        return formula
+    value = cell.get("value")
+    if value is not None:
+        return value
+    if formula:
+        return formula
+    literal = cell.get("literal")
+    return literal if literal is not None else ""
+
+
 def _sheet_metadata(
     ws: Any,
     profile: SheetProfile,
@@ -604,7 +683,14 @@ def extract_workbook(
         "sheets": [],
         "table_lookup": {},
         "warnings": all_warnings,
-        "totals": {"sheets": 0, "tables": 0, "cells": 0, "formulas": 0},
+        "totals": {
+            "sheets": 0,
+            "tables": 0,
+            "raw_regions": 0,
+            "excluded_regions": 0,
+            "cells": 0,
+            "formulas": 0,
+        },
     }
     sheet_manifests: list[dict[str, Any]] = []
     workbook_fingerprints: list[dict[str, Any]] = []
@@ -621,7 +707,13 @@ def extract_workbook(
     ]
     table_index_fields = [
         "table_id", "sheet", "title", "range", "layout_kind", "confidence",
-        "uncertain", "methods", "rows", "columns", "long_records", "relative_path",
+        "uncertain", "methods", "rows", "columns", "long_records",
+        "clean_status", "clean_title", "clean_rows", "clean_columns",
+        "relative_path",
+    ]
+    clean_index_fields = [
+        "table_id", "sheet", "title", "source_range", "rows", "columns",
+        "json_path", "csv_path", "formulas_csv_path",
     ]
 
     try:
@@ -629,6 +721,10 @@ def extract_workbook(
             long_jsonl = bundle.open_text("records_long.jsonl", newline="\n")
             long_csv = bundle.csv_writer("records_long.csv", csv_fields)
             table_index = bundle.csv_writer("tables_index.csv", table_index_fields)
+            clean_jsonl = bundle.open_text("clean_records.jsonl", newline="\n")
+            clean_index = bundle.csv_writer(
+                "clean_tables_index.csv", clean_index_fields
+            )
 
             for sheet_index, sheet_name in enumerate(selected_sheets, 1):
                 ws = workbook_formula[sheet_name]
@@ -843,6 +939,8 @@ def extract_workbook(
 
                 table_entries: list[dict[str, Any]] = []
                 report_sheet_tables: list[dict[str, Any]] = []
+                clean_tables_in_sheet = 0
+                excluded_regions_in_sheet = 0
                 for ordinal, (candidate, structure, table_id) in enumerate(structures, 1):
                     columns = _structure_columns(structure)
                     rows = _structure_rows(structure)
@@ -898,6 +996,130 @@ def extract_workbook(
                         "physical_columns": candidate.bounds.width,
                         "long_records": long_count,
                     }
+
+                    clean = build_clean_table(table_entry, structure, snapshots)
+                    clean_json_path = table_relative / "clean_table.json"
+                    bundle.write_json(clean_json_path, clean)
+                    clean_files: dict[str, str] = {
+                        "json": str(clean_json_path).replace("\\", "/"),
+                    }
+                    clean_status = str(clean.get("status", "empty"))
+                    clean_counts = dict(clean.get("counts", {}))
+                    if clean_status == "ready":
+                        clean_tables_in_sheet += 1
+                        clean_columns = list(clean.get("columns", []))
+                        clean_rows = list(clean.get("rows", []))
+                        clean_labels = [
+                            str(column.get("label") or column.get("key") or "Column")
+                            for column in clean_columns
+                        ]
+                        clean_keys = [
+                            str(column.get("key") or f"column_{index + 1}")
+                            for index, column in enumerate(clean_columns)
+                        ]
+                        clean_csv_path = table_relative / "clean_table.csv"
+                        formulas_csv_path = table_relative / "clean_formulas.csv"
+                        clean_writer = bundle.csv_writer(clean_csv_path, clean_labels)
+                        formula_writer = bundle.csv_writer(
+                            formulas_csv_path, clean_labels
+                        )
+                        for clean_row in clean_rows:
+                            cells = list(clean_row.get("cells", []))
+                            value_row: dict[str, Any] = {}
+                            formula_row: dict[str, Any] = {}
+                            values_by_key: dict[str, Any] = {}
+                            formulas_by_key: dict[str, Any] = {}
+                            source_cells: dict[str, Any] = {}
+                            for index, (label, key) in enumerate(
+                                zip(clean_labels, clean_keys)
+                            ):
+                                cell = cells[index] if index < len(cells) else {}
+                                value = _clean_cell_export_value(
+                                    cell, formula_view=False
+                                )
+                                formula_value = _clean_cell_export_value(
+                                    cell, formula_view=True
+                                )
+                                value_row[label] = (
+                                    safe_csv_text(value)
+                                    if config.csv_formula_injection_safe
+                                    else value
+                                )
+                                formula_row[label] = (
+                                    safe_csv_text(formula_value)
+                                    if config.csv_formula_injection_safe
+                                    else formula_value
+                                )
+                                values_by_key[key] = value
+                                formulas_by_key[key] = cell.get("formula")
+                                source_cells[key] = (
+                                    cell.get("value_source_coordinate")
+                                    or cell.get("coordinate")
+                                )
+                            clean_writer.writerow(value_row)
+                            formula_writer.writerow(formula_row)
+                            clean_jsonl.write(
+                                canonical_json(
+                                    {
+                                        "table_id": table_id,
+                                        "sheet": sheet_name,
+                                        "title": clean.get("title"),
+                                        "source_row": clean_row.get("source_row"),
+                                        "row_role": clean_row.get("role"),
+                                        "section_path": clean_row.get(
+                                            "section_path", []
+                                        ),
+                                        "values": values_by_key,
+                                        "formulas": formulas_by_key,
+                                        "source_cells": source_cells,
+                                    }
+                                )
+                                + "\n"
+                            )
+                        clean_files.update(
+                            {
+                                "csv": str(clean_csv_path).replace("\\", "/"),
+                                "formulas_csv": str(formulas_csv_path).replace(
+                                    "\\", "/"
+                                ),
+                            }
+                        )
+                        clean_index.writerow(
+                            {
+                                "table_id": table_id,
+                                "sheet": sheet_name,
+                                "title": clean.get("title"),
+                                "source_range": candidate.bounds.ref,
+                                "rows": clean_counts.get("rows", len(clean_rows)),
+                                "columns": clean_counts.get(
+                                    "columns", len(clean_columns)
+                                ),
+                                "json_path": clean_files["json"],
+                                "csv_path": clean_files["csv"],
+                                "formulas_csv_path": clean_files["formulas_csv"],
+                            }
+                        )
+                    else:
+                        excluded_regions_in_sheet += 1
+                    table_entry["clean"] = {
+                        "status": clean_status,
+                        "title": clean.get("title"),
+                        "source_range": clean.get("source_range"),
+                        "header_rows": clean.get("header_rows", []),
+                        "columns": clean.get("columns", []),
+                        "dropped_rows": clean.get("dropped_rows", []),
+                        "dropped_columns": clean.get("dropped_columns", []),
+                        "counts": clean_counts,
+                        "files": clean_files,
+                    }
+                    table_entry["counts"].update(
+                        {
+                            "clean_rows": int(clean_counts.get("rows", 0) or 0),
+                            "clean_columns": int(
+                                clean_counts.get("columns", 0) or 0
+                            ),
+                        }
+                    )
                     bundle.write_json(table_relative / "table.json", table_entry)
 
                     # Wide review export retains a row-role and row-path prefix.
@@ -949,18 +1171,27 @@ def extract_workbook(
                             "rows": candidate.bounds.height,
                             "columns": candidate.bounds.width,
                             "long_records": long_count,
+                            "clean_status": clean_status,
+                            "clean_title": clean.get("title"),
+                            "clean_rows": clean_counts.get("rows", 0),
+                            "clean_columns": clean_counts.get("columns", 0),
                             "relative_path": table_entry["relative_path"],
                         }
                     )
                     report_table = _table_preview(table_entry, structure, snapshots, config)
+                    report_table["clean"] = _clean_table_preview(clean, config)
                     report_data["table_lookup"][table_id] = report_table
                     report_sheet_tables.append(
                         {
                             "table_id": table_id,
-                            "title": table_entry["title"],
+                            "title": clean.get("title") or table_entry["title"],
                             "range": candidate.bounds.ref,
                             "confidence": candidate.confidence,
                             "uncertain": candidate.uncertain,
+                            "clean_status": clean_status,
+                            "clean_title": clean.get("title"),
+                            "clean_rows": clean_counts.get("rows", 0),
+                            "clean_columns": clean_counts.get("columns", 0),
                         }
                     )
 
@@ -980,6 +1211,8 @@ def extract_workbook(
                         "exported_cells": len(snapshots),
                         "exported_formulas": formula_cells,
                         "detected_tables": len(table_entries),
+                        "clean_tables": clean_tables_in_sheet,
+                        "excluded_regions": excluded_regions_in_sheet,
                         "annotations": len(annotations),
                     }
                 )
@@ -997,6 +1230,12 @@ def extract_workbook(
                                 "title": item["title"],
                                 "range": item["range"],
                                 "confidence": item["confidence"],
+                                "clean_status": item.get("clean", {}).get("status"),
+                                "clean_title": item.get("clean", {}).get("title"),
+                                "clean_rows": item.get("counts", {}).get("clean_rows", 0),
+                                "clean_columns": item.get("counts", {}).get(
+                                    "clean_columns", 0
+                                ),
                             }
                             for item in table_entries
                         ],
@@ -1014,7 +1253,11 @@ def extract_workbook(
                     }
                 )
                 report_data["totals"]["sheets"] += 1
-                report_data["totals"]["tables"] += len(table_entries)
+                report_data["totals"]["tables"] += clean_tables_in_sheet
+                report_data["totals"]["raw_regions"] += len(table_entries)
+                report_data["totals"]["excluded_regions"] += (
+                    excluded_regions_in_sheet
+                )
                 report_data["totals"]["cells"] += len(snapshots)
                 report_data["totals"]["formulas"] += formula_cells
 
@@ -1071,6 +1314,8 @@ def extract_workbook(
                 "records_long_jsonl": "records_long.jsonl",
                 "records_long_csv": "records_long.csv",
                 "tables_index_csv": "tables_index.csv",
+                "clean_records_jsonl": "clean_records.jsonl",
+                "clean_tables_index_csv": "clean_tables_index.csv",
                 "report_html": "report.html",
                 "fingerprints": {
                     "structure_sha256": stable_hash(
@@ -1093,7 +1338,11 @@ def extract_workbook(
                 },
                 "warnings": all_warnings,
             }
-            report_data["warnings"] = all_warnings
+            report_data["warning_total"] = len(all_warnings)
+            report_data["warning_summary"] = _summarize_warnings(all_warnings)
+            # Keep a bounded representative sample in the self-contained HTML;
+            # manifest.json remains the complete authoritative warning stream.
+            report_data["warnings"] = all_warnings[:200]
             bundle.write_json("styles.json", styles.to_dict())
             bundle.write_json("schema.json", BUNDLE_SCHEMA)
             bundle.write_json("manifest.json", manifest)
